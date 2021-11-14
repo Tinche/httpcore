@@ -114,7 +114,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         self._network_backend = (
             AutoBackend() if network_backend is None else network_backend
         )
-        self._closer: Optional[TaskGroup] = None
+        self._closer: TaskGroup = create_task_group()
 
     def create_connection(self, origin: Origin) -> AsyncConnectionInterface:
         return AsyncHTTPConnection(
@@ -147,14 +147,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         """
         return list(self._pool)
 
-    async def _get_closer(self) -> TaskGroup:
-        if self._closer is None:
-            self._closer = await create_task_group().__aenter__()
-        return self._closer
-
-    def _attempt_to_acquire_connection(
-        self, status: RequestStatus, closer: TaskGroup
-    ) -> bool:
+    def _attempt_to_acquire_connection(self, status: RequestStatus) -> bool:
         """
         Attempt to provide a connection that can handle the given origin.
         """
@@ -178,7 +171,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         if len(self._pool) >= self._max_connections:
             for idx, connection in reversed(list(enumerate(self._pool))):
                 if connection.is_idle():
-                    closer.start_soon(connection.aclose)
+                    self._closer.start_soon(connection.aclose)
                     self._pool.pop(idx)
                     break
 
@@ -192,14 +185,14 @@ class AsyncConnectionPool(AsyncRequestInterface):
         status.set_connection(connection)
         return True
 
-    def _close_expired_connections(self, closer: TaskGroup) -> None:
+    def _close_expired_connections(self) -> None:
         """
         Clean up the connection pool by closing off any connections that have expired.
         """
         # Close any connections that have expired their keep-alive time.
         for idx, connection in reversed(list(enumerate(self._pool))):
             if connection.has_expired():
-                closer.start_soon(connection.aclose)
+                self._closer.start_soon(connection.aclose)
                 self._pool.pop(idx)
 
         # If the pool size exceeds the maximum number of allowed keep-alive connections,
@@ -207,7 +200,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         pool_size = len(self._pool)
         for idx, connection in reversed(list(enumerate(self._pool))):
             if connection.is_idle() and pool_size > self._max_keepalive_connections:
-                closer.start_soon(connection.aclose)
+                self._closer.start_soon(connection.aclose)
                 self._pool.pop(idx)
                 pool_size -= 1
 
@@ -228,11 +221,10 @@ class AsyncConnectionPool(AsyncRequestInterface):
             )
 
         status = RequestStatus(request)
-        closer = await self._get_closer()
 
         self._requests.append(status)
-        self._close_expired_connections(closer)
-        self._attempt_to_acquire_connection(status, closer)
+        self._close_expired_connections()
+        self._attempt_to_acquire_connection(status)
 
         while True:
             timeouts = request.extensions.get("timeout", {})
@@ -251,7 +243,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 # Maintain our position in the request queue, but reset the
                 # status so that the request becomes queued again.
                 status.unset_connection()
-                self._attempt_to_acquire_connection(status, closer)
+                self._attempt_to_acquire_connection(status)
             except Exception as exc:
                 await self.response_closed(status)
                 raise exc
@@ -277,7 +269,6 @@ class AsyncConnectionPool(AsyncRequestInterface):
         """
         assert status.connection is not None
         connection = status.connection
-        closer = await self._get_closer()
 
         # Update the state of the connection pool.
         self._requests.remove(status)
@@ -289,7 +280,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         # to service one or more requests that are currently pending.
         for status in self._requests:
             if status.connection is None:
-                acquired = self._attempt_to_acquire_connection(status, closer)
+                acquired = self._attempt_to_acquire_connection(status)
                 # If we could not acquire a connection for a queued request
                 # then we don't need to check anymore requests that are
                 # queued later behind it.
@@ -297,20 +288,20 @@ class AsyncConnectionPool(AsyncRequestInterface):
                     break
 
         # Housekeeping.
-        self._close_expired_connections(closer)
+        self._close_expired_connections()
 
     async def aclose(self) -> None:
         """
         Close any connections in the pool.
         """
-        closer = await self._get_closer()
         for connection in self._pool:
-            closer.start_soon(connection.aclose)
+            self._closer.start_soon(connection.aclose)
         self._pool = []
         self._requests = []
-        await closer.__aexit__(None, None, None)
+        await self._closer.__aexit__(None, None, None)
 
     async def __aenter__(self) -> "AsyncConnectionPool":
+        await self._closer.__aenter__()
         return self
 
     async def __aexit__(
