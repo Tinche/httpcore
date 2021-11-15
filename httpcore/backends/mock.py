@@ -1,5 +1,8 @@
 import ssl
 import typing
+from typing import List, Tuple
+
+from anyio import sleep
 
 from .base import AsyncNetworkBackend, AsyncNetworkStream, NetworkBackend, NetworkStream
 
@@ -86,6 +89,37 @@ class AsyncMockStream(AsyncNetworkStream):
         return MockSSLObject(http2=self._http2) if info == "ssl_object" else None
 
 
+class AsyncDelayingMockStream(AsyncNetworkStream):
+    def __init__(self, buffer: List[Tuple[float, bytes]], http2: bool = False) -> None:
+        self._original_buffer = buffer
+        self._current_buffer = list(self._original_buffer)
+        self._http2 = http2
+
+    async def read(self, max_bytes: int, timeout: float = None) -> bytes:
+        if not self._current_buffer:
+            self._current_buffer = list(self._original_buffer)
+        delay, res = self._current_buffer.pop(0)
+        await sleep(delay)
+        return res
+
+    async def write(self, buffer: bytes, timeout: float = None) -> None:
+        pass
+
+    async def aclose(self) -> None:
+        pass
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str = None,
+        timeout: float = None,
+    ) -> AsyncNetworkStream:
+        return self
+
+    def get_extra_info(self, info: str) -> typing.Any:
+        return MockSSLObject(http2=self._http2) if info == "ssl_object" else None
+
+
 class AsyncMockBackend(AsyncNetworkBackend):
     def __init__(self, buffer: typing.List[bytes], http2: bool = False) -> None:
         self._buffer = buffer
@@ -100,6 +134,25 @@ class AsyncMockBackend(AsyncNetworkBackend):
         self, path: str, timeout: float = None
     ) -> AsyncNetworkStream:
         return AsyncMockStream(list(self._buffer), http2=self._http2)
+
+    async def sleep(self, seconds: float) -> None:
+        pass
+
+
+class AsyncDelayingMockBackend(AsyncNetworkBackend):
+    def __init__(self, buffer: List[Tuple[float, bytes]], http2: bool = False) -> None:
+        self._buffer = buffer
+        self._http2 = http2
+
+    async def connect_tcp(
+        self, host: str, port: int, timeout: float = None, local_address: str = None
+    ) -> AsyncNetworkStream:
+        return AsyncDelayingMockStream(list(self._buffer), http2=self._http2)
+
+    async def connect_unix_socket(
+        self, path: str, timeout: float = None
+    ) -> AsyncNetworkStream:
+        return AsyncDelayingMockStream(list(self._buffer), http2=self._http2)
 
     async def sleep(self, seconds: float) -> None:
         pass

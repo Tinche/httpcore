@@ -4,7 +4,7 @@ import pytest
 import trio as concurrency
 
 from httpcore import AsyncConnectionPool, ConnectError, UnsupportedProtocol
-from httpcore.backends.mock import AsyncMockBackend
+from httpcore.backends.mock import AsyncDelayingMockBackend, AsyncMockBackend
 
 
 @pytest.mark.anyio
@@ -433,3 +433,62 @@ async def test_unsupported_protocol():
 
         with pytest.raises(UnsupportedProtocol):
             await pool.request("GET", "://www.example.com/")
+
+
+@pytest.mark.trio
+async def test_connection_pool_cancellation():
+    """
+    Requests cancelled while waiting for a response should allow other connections to progress.
+    """
+    network_backend = AsyncDelayingMockBackend(
+        [
+            (
+                0.1,
+                b"HTTP/1.1 200 OK\r\nContent-Type: plain/text\r\nContent-Length: 13\r\n\r\nHello, world!",
+            )
+        ]
+    )
+
+    async def fetch(pool, domain, info_list):
+        async with pool.stream("GET", f"https://{domain}/") as response:
+            info = [repr(c) for c in pool.connections]
+            info_list.append(info)
+            await response.aread()
+
+    async with AsyncConnectionPool(
+        max_connections=2, network_backend=network_backend, http2=False
+    ) as pool:
+        info_list: List[str] = []
+        with concurrency.move_on_after(0.01):
+            await fetch(pool, "https://example.com", info_list)
+        assert not pool._pool
+
+    # If a task is cancelled while waiting for a connection, it doesn't block the pool.
+    async with AsyncConnectionPool(
+        max_connections=1, network_backend=network_backend, http2=False
+    ) as pool:
+        info_list: List[str] = []
+        async with concurrency.open_nursery() as nursery:
+            # Request #1, we let finish gracefully.
+            nursery.start_soon(fetch, pool, "https://example.com", info_list)
+            await concurrency.sleep(0)
+
+            # Enter a new scope so we can cancel it.
+            with concurrency.move_on_after(0.05) as scope:
+                async with concurrency.open_nursery() as inner_nursery:
+                    # Request #2, which we will cancel shortly.
+                    inner_nursery.start_soon(
+                        fetch, pool, "https://example.com", info_list
+                    )
+            await concurrency.sleep(0)
+
+            # Request #3, which needs to be able to proceed once Request #2 gets cancelled.
+            nursery.start_soon(fetch, pool, "https://example.com", info_list)
+            await concurrency.sleep(0)
+
+            scope.cancel()
+            await concurrency.sleep(0)
+
+            assert len(pool._requests) == 2  # Reqs #1 and #3
+        assert len(pool._pool) == 1
+        assert not pool._requests

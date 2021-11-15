@@ -3,7 +3,7 @@ import sys
 from types import TracebackType
 from typing import AsyncIterable, AsyncIterator, List, Optional, Type
 
-from anyio import create_task_group
+from anyio import create_task_group, get_cancelled_exc_class
 from anyio.abc import TaskGroup
 
 from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
@@ -204,6 +204,16 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 self._pool.pop(idx)
                 pool_size -= 1
 
+    def _attempt_starting_queued(self):
+        for status in self._requests:
+            if status.connection is None:
+                acquired = self._attempt_to_acquire_connection(status)
+                # If we could not acquire a connection for a queued request
+                # then we don't need to check anymore requests that are
+                # queued later behind it.
+                if not acquired:
+                    break
+
     async def handle_async_request(self, request: Request) -> Response:
         """
         Send an HTTP request, and return an HTTP response.
@@ -229,7 +239,15 @@ class AsyncConnectionPool(AsyncRequestInterface):
         while True:
             timeouts = request.extensions.get("timeout", {})
             timeout = timeouts.get("pool", None)
-            connection = await status.wait_for_connection(timeout=timeout)
+            try:
+                connection = await status.wait_for_connection(timeout=timeout)
+            except get_cancelled_exc_class():
+                # We were cancelled while waiting for a connection.
+                self._requests.remove(status)
+                if status.connection is not None:
+                    self._attempt_starting_queued()
+                raise
+
             try:
                 response = await connection.handle_async_request(request)
             except ConnectionNotAvailable:
@@ -244,6 +262,18 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 # status so that the request becomes queued again.
                 status.unset_connection()
                 self._attempt_to_acquire_connection(status)
+            except get_cancelled_exc_class():
+                # The task performing this request has been cancelled.
+                # Since we don't know the state of the underlying connection,
+                # we remove the connection from the pool and close it.
+                self._pool.remove(connection)
+                self._closer.start_soon(connection.aclose)
+                self._requests.remove(status)
+
+                # Since a connection has been closed, it's possible a different
+                # request may now proceed.
+                self._attempt_starting_queued()
+                raise
             except Exception as exc:
                 await self.response_closed(status)
                 raise exc
@@ -278,14 +308,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
 
         # Since we've had a response closed, it's possible we'll now be able
         # to service one or more requests that are currently pending.
-        for status in self._requests:
-            if status.connection is None:
-                acquired = self._attempt_to_acquire_connection(status)
-                # If we could not acquire a connection for a queued request
-                # then we don't need to check anymore requests that are
-                # queued later behind it.
-                if not acquired:
-                    break
+        self._attempt_starting_queued()
 
         # Housekeeping.
         self._close_expired_connections()
