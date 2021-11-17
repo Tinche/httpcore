@@ -1,7 +1,16 @@
 import ssl
 import sys
+from contextlib import suppress
 from types import TracebackType
-from typing import AsyncIterable, AsyncIterator, List, Optional, Type
+from typing import (
+    AsyncIterable,
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    List,
+    Optional,
+    Type,
+)
 
 from anyio import create_task_group, get_cancelled_exc_class
 from anyio.abc import TaskGroup
@@ -38,6 +47,15 @@ class RequestStatus:
         await self._connection_acquired.wait(timeout=timeout)
         assert self.connection is not None
         return self.connection
+
+
+async def await_suppressing(awaitable: Callable[..., Coroutine]) -> None:
+    """
+    A task group will propagate errors, which is what we don't want when closing connections.
+    Hence, this small helper to suppress them.
+    """
+    with suppress(Exception):
+        await awaitable()
 
 
 class AsyncConnectionPool(AsyncRequestInterface):
@@ -171,7 +189,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         if len(self._pool) >= self._max_connections:
             for idx, connection in reversed(list(enumerate(self._pool))):
                 if connection.is_idle():
-                    self._closer.start_soon(connection.aclose)
+                    self._closer.start_soon(await_suppressing, connection.aclose)
                     self._pool.pop(idx)
                     break
 
@@ -192,7 +210,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         # Close any connections that have expired their keep-alive time.
         for idx, connection in reversed(list(enumerate(self._pool))):
             if connection.has_expired():
-                self._closer.start_soon(connection.aclose)
+                self._closer.start_soon(await_suppressing, connection.aclose)
                 self._pool.pop(idx)
 
         # If the pool size exceeds the maximum number of allowed keep-alive connections,
@@ -200,11 +218,11 @@ class AsyncConnectionPool(AsyncRequestInterface):
         pool_size = len(self._pool)
         for idx, connection in reversed(list(enumerate(self._pool))):
             if connection.is_idle() and pool_size > self._max_keepalive_connections:
-                self._closer.start_soon(connection.aclose)
+                self._closer.start_soon(await_suppressing, connection.aclose)
                 self._pool.pop(idx)
                 pool_size -= 1
 
-    def _attempt_starting_queued(self):
+    def _attempt_starting_queued(self) -> None:
         for status in self._requests:
             if status.connection is None:
                 acquired = self._attempt_to_acquire_connection(status)
@@ -267,7 +285,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 # Since we don't know the state of the underlying connection,
                 # we remove the connection from the pool and close it.
                 self._pool.remove(connection)
-                self._closer.start_soon(connection.aclose)
+                self._closer.start_soon(await_suppressing, connection.aclose)
                 self._requests.remove(status)
 
                 # Since a connection has been closed, it's possible a different
@@ -318,6 +336,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         Close any connections in the pool.
         """
         for connection in self._pool:
+            # It's ok to propagate potential errors here.
             self._closer.start_soon(connection.aclose)
         self._pool = []
         self._requests = []

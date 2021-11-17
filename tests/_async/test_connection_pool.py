@@ -2,9 +2,14 @@ from typing import List
 
 import pytest
 import trio as concurrency
+from anyio import sleep
 
 from httpcore import AsyncConnectionPool, ConnectError, UnsupportedProtocol
-from httpcore.backends.mock import AsyncDelayingMockBackend, AsyncMockBackend
+from httpcore.backends.mock import (
+    AsyncDelayingMockBackend,
+    AsyncMockBackend,
+    AsyncMockStream,
+)
 
 
 @pytest.mark.anyio
@@ -449,41 +454,35 @@ async def test_connection_pool_cancellation():
         ]
     )
 
-    async def fetch(pool, domain, info_list):
+    async def fetch(pool, domain):
         async with pool.stream("GET", f"https://{domain}/") as response:
-            info = [repr(c) for c in pool.connections]
-            info_list.append(info)
             await response.aread()
 
     async with AsyncConnectionPool(
         max_connections=2, network_backend=network_backend, http2=False
     ) as pool:
-        info_list: List[str] = []
         with concurrency.move_on_after(0.01):
-            await fetch(pool, "https://example.com", info_list)
+            await fetch(pool, "https://example.com")
         assert not pool._pool
 
     # If a task is cancelled while waiting for a connection, it doesn't block the pool.
     async with AsyncConnectionPool(
         max_connections=1, network_backend=network_backend, http2=False
     ) as pool:
-        info_list: List[str] = []
         async with concurrency.open_nursery() as nursery:
             # Request #1, we let finish gracefully.
-            nursery.start_soon(fetch, pool, "https://example.com", info_list)
+            nursery.start_soon(fetch, pool, "https://example.com")
             await concurrency.sleep(0)
 
             # Enter a new scope so we can cancel it.
             with concurrency.move_on_after(0.05) as scope:
                 async with concurrency.open_nursery() as inner_nursery:
                     # Request #2, which we will cancel shortly.
-                    inner_nursery.start_soon(
-                        fetch, pool, "https://example.com", info_list
-                    )
+                    inner_nursery.start_soon(fetch, pool, "https://example.com")
             await concurrency.sleep(0)
 
             # Request #3, which needs to be able to proceed once Request #2 gets cancelled.
-            nursery.start_soon(fetch, pool, "https://example.com", info_list)
+            nursery.start_soon(fetch, pool, "https://example.com")
             await concurrency.sleep(0)
 
             scope.cancel()
@@ -492,3 +491,41 @@ async def test_connection_pool_cancellation():
             assert len(pool._requests) == 2  # Reqs #1 and #3
         assert len(pool._pool) == 1
         assert not pool._requests
+
+
+@pytest.mark.anyio
+async def test_connection_close_error():
+    """
+    Connections raising errors while closing shouldn't stop the pool.
+    """
+
+    class ErrorAsyncMockStream(AsyncMockStream):
+        async def aclose(self) -> None:
+            raise Exception()
+
+    network_backend = AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\nContent-Type: plain/text\r\nContent-Length: 13\r\n\r\nHello, world!",
+        ],
+        stream_cls=ErrorAsyncMockStream,
+    )
+
+    # We don't use an async context manager to have better control over
+    # exception catching.
+    pool = AsyncConnectionPool(keepalive_expiry=0.001, network_backend=network_backend)
+    await pool.__aenter__()
+    async with pool.stream("GET", "http://example.com") as response:
+        await response.aread()
+    first_conn = pool.connections[0]
+
+    # Now we sleep to expire the connection.
+    await sleep(0.005)
+
+    async with pool.stream("GET", "http://example.com") as response:
+        await response.aread()
+
+    assert pool.connections[0] is not first_conn  # A new connection
+
+    with pytest.raises(Exception):
+        # We don't swallog closing errors on final cleanup.
+        await pool.__aexit__()

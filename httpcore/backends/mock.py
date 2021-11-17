@@ -1,6 +1,6 @@
 import ssl
 import typing
-from typing import List, Tuple
+from typing import List, Tuple, Type
 
 from anyio import sleep
 
@@ -121,19 +121,25 @@ class AsyncDelayingMockStream(AsyncNetworkStream):
 
 
 class AsyncMockBackend(AsyncNetworkBackend):
-    def __init__(self, buffer: typing.List[bytes], http2: bool = False) -> None:
+    def __init__(
+        self,
+        buffer: typing.List[bytes],
+        http2: bool = False,
+        stream_cls: Type[AsyncMockStream] = AsyncMockStream,
+    ) -> None:
         self._buffer = buffer
         self._http2 = http2
+        self._stream_cls = stream_cls
 
     async def connect_tcp(
         self, host: str, port: int, timeout: float = None, local_address: str = None
     ) -> AsyncNetworkStream:
-        return AsyncMockStream(list(self._buffer), http2=self._http2)
+        return self._stream_cls(list(self._buffer), http2=self._http2)
 
     async def connect_unix_socket(
         self, path: str, timeout: float = None
     ) -> AsyncNetworkStream:
-        return AsyncMockStream(list(self._buffer), http2=self._http2)
+        return self._stream_cls(list(self._buffer), http2=self._http2)
 
     async def sleep(self, seconds: float) -> None:
         pass
