@@ -15,14 +15,14 @@ from typing import (
 from anyio import create_task_group, get_cancelled_exc_class
 from anyio.abc import TaskGroup
 
-from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
-from .._models import Origin, Request, Response
-from .._ssl import default_ssl_context
-from .._synchronization import AsyncEvent
-from ..backends.auto import AutoBackend
-from ..backends.base import AsyncNetworkBackend
-from .connection import AsyncHTTPConnection
-from .interfaces import AsyncConnectionInterface, AsyncRequestInterface
+from httpcore._async.connection import AsyncHTTPConnection
+from httpcore._async.interfaces import AsyncConnectionInterface, AsyncRequestInterface
+from httpcore._exceptions import ConnectionNotAvailable, UnsupportedProtocol
+from httpcore._models import Origin, Request, Response
+from httpcore._ssl import default_ssl_context
+from httpcore._synchronization import AsyncEvent
+from httpcore.backends.auto import AutoBackend
+from httpcore.backends.base import AsyncNetworkBackend
 
 
 class RequestStatus:
